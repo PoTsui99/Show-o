@@ -128,12 +128,36 @@ def preprocess_v0(
     )
 
 
-class LLaVAInstructDataset(Dataset):
+# Define constants
+IMAGENET_MEAN = (0.485, 0.456, 0.406)
+IMAGENET_STD = (0.229, 0.224, 0.225)
 
-    def __init__(self, tokenizer):
+def expand2square(pil_img, background_color):
+    """
+    Expand image to square with specified background color.
+    background_color should be a tuple of RGB values (0-255).
+    """
+    width, height = pil_img.size
+    if width == height:
+        return pil_img
+    elif width > height:
+        result = Image.new(pil_img.mode, (width, width), background_color)
+        result.paste(pil_img, (0, (width - height) // 2))
+        return result
+    else:
+        result = Image.new(pil_img.mode, (height, height), background_color)
+        result.paste(pil_img, ((height - width) // 2, 0))
+        return result
+
+class LLaVAInstructDataset(Dataset):
+    def __init__(self, tokenizer, pad2square=False):
         super(LLaVAInstructDataset, self).__init__()
 
         self.tokenizer = tokenizer
+        self.pad2square = pad2square
+
+        # Convert IMAGENET_MEAN from [0,1] to [0,255] for padding
+        self.background_color = tuple(int(x * 255) for x in IMAGENET_MEAN)
 
         data_file_path = "/mnt/bn/vgfm2/test_dit/llava_v1_5_mix665k.json"
         self.image_root = "/mnt/bn/vgfm2/test_dit/tuning_data"
@@ -146,6 +170,10 @@ class LLaVAInstructDataset(Dataset):
                 self.list_data_dict.append(item)
 
         self.processor = CLIPImageProcessor.from_pretrained("openai/clip-vit-large-patch14-336")
+        
+        # Verify that processor's crop size is square
+        assert self.processor.crop_size['height'] == self.processor.crop_size['width'], \
+            "Processor crop size must be square"
 
         print("Formatting llava instruction data")
 
@@ -161,33 +189,46 @@ class LLaVAInstructDataset(Dataset):
         assert 'image' in sources[0]
         image_file = self.list_data_dict[i]['image']
         image_folder = self.image_root
+        
         try:
             image = Image.open(os.path.join(image_folder, image_file)).convert('RGB')
+            
+            # Get target size from processor
+            target_size = self.processor.crop_size['height']  # We've asserted height == width
+            
+            if self.pad2square:
+                # Expand to square with ImageNet mean values as background
+                image = expand2square(image, self.background_color)
+            
+            # Resize to target size
+            image = image.resize((target_size, target_size), Image.Resampling.BICUBIC)
+            
+            # Apply CLIP preprocessing
             image = self.processor.preprocess(image, return_tensors='pt')['pixel_values'][0]
-        except:
-            print("Read image error. Use dummy data.")
-            crop_size = 336
-            image = torch.zeros(3, crop_size, crop_size)
+            
+        except Exception as e:
+            print(f"Read image error: {str(e)}. Use dummy data.")
+            target_size = self.processor.crop_size['height']
+            image = torch.zeros(3, target_size, target_size)
 
         sources = preprocess_multimodal(copy.deepcopy([e["conversations"] for e in sources]))
-
         data_dict = preprocess_v0(sources, self.tokenizer)
 
         if isinstance(i, int):
             data_dict = dict(input_ids=data_dict["input_ids"][0],
-                             labels=data_dict["labels"][0],
-                             input_ids_system=data_dict["input_ids_system"][0])
+                           labels=data_dict["labels"][0],
+                           input_ids_system=data_dict["input_ids_system"][0])
 
         # image exist in the data
         if 'image' in self.list_data_dict[i]:
             data_dict['image'] = image
         else:
             # image does not exist in the data, but the model is multimodal
-            crop_size = 336
-            data_dict['image'] = torch.zeros(3, crop_size, crop_size)
+            target_size = self.processor.crop_size['height']
+            data_dict['image'] = torch.zeros(3, target_size, target_size)
 
         return data_dict
-
+    
 
 def collate_fn(
         instances,
